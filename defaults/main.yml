@@ -1,0 +1,16 @@
+---
+# Variable that controls whether rolling deployment is starting or not
+rolling_deploy_starting: false
+
+# The IPv4 and IPv6 parent servers to be blocked/unblocked during rolling deployment
+# The IPv4 is mandatory. The IPv6 is optional.
+rolling_deploy_parent_servers_ipv4: []
+rolling_deploy_parent_servers_ipv6: []
+
+# Determine the iptables state based on whether rolling deployment is starting or not
+rolling_deploy_iptables_state: "{{ 'present' if ( rolling_deploy_starting | default('false') ) else 'absent' }}"
+
+# Block both FORWARD and INPUT chains to cover both Docker and non-Docker deployments
+rolling_deploy_chains:
+  - FORWARD # if docker based deployment
+  - INPUT   # if non-docker based deployment or docker using host network mode

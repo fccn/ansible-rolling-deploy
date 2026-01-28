@@ -1,0 +1,62 @@
+---
+
+- name: Check if rolling_deploy_parent_servers_ipv4 is defined
+  assert:
+    that:
+      - rolling_deploy_parent_servers_ipv4 is defined
+      - rolling_deploy_parent_servers_ipv4 | length > 0
+    fail_msg: "rolling_deploy_parent_servers_ipv4 is not defined or empty. Please define it in your playbook or inventory."
+  tags: 
+    - rolling_deploy
+    - always
+
+- name: Debug rolling deploy action IPv4
+  debug:
+    msg: "{{ 'Block' if ( rolling_deploy_starting | default('false') ) else 'Open' }} parent servers {{ rolling_deploy_parent_servers_ipv4 | join(',') }} on iptables"
+  tags: 
+    - rolling_deploy
+    - always
+
+- name: Change parent servers IPv4 using iptables
+  iptables: 
+    ip_version: ipv4
+    action: insert # rule should be inserted at the top
+    rule_num: "1"
+    chain: "{{ item }}"
+    source: "{{ rolling_deploy_parent_servers_ipv4 | join(',') }}"
+    jump: DROP
+    comment: Block parent servers connections to forward traffic to other server
+    state: "{{ rolling_deploy_iptables_state }}" # present or absent
+  loop: "{{ rolling_deploy_chains }}"
+  when: rolling_deploy_parent_servers_ipv4 | length > 0
+  become: yes
+  tags: 
+    - rolling_deploy
+    - always
+
+- name: Debug rolling deploy action IPv6
+  debug:
+    msg: "{{ 'Block' if ( rolling_deploy_starting | default('false') ) else 'Open' }} parent servers {{ rolling_deploy_parent_servers_ipv6 | join(',') }} on iptables"
+  when: rolling_deploy_parent_servers_ipv6 | length > 0
+  tags: 
+    - rolling_deploy
+    - always
+
+- name: Change parent servers IPv6 using iptables
+  iptables: 
+    ip_version: ipv6
+    # Rule should be inserted at the top
+    action: insert
+    # Insert the rule as the given rule number. This works only with action=insert.
+    rule_num: "1"
+    chain: "{{ item }}"
+    source: "{{ rolling_deploy_parent_servers_ipv6 | join(',') }}"
+    jump: DROP
+    comment: Block parent servers connections to forward traffic to other server
+    state: "{{ rolling_deploy_iptables_state }}" # present or absent
+  loop: "{{ rolling_deploy_chains }}"
+  when: rolling_deploy_parent_servers_ipv6 | length > 0
+  become: yes
+  tags: 
+    - rolling_deploy
+    - always

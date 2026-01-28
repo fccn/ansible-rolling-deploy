@@ -1,0 +1,29 @@
+---
+galaxy_info:
+  author: Ivo Branco
+  description: Ansible role for rolling deployments using iptables to block/unblock parent servers.
+  company: fccn
+  license: GPL-3.0
+  min_ansible_version: "2.9"
+  
+  platforms:
+    - name: Ubuntu
+      versions:
+        - focal
+        - jammy
+    - name: Debian
+      versions:
+        - bullseye
+        - bookworm
+    - name: CentOS
+      versions:
+        - 8
+        - 9
+
+  galaxy_tags:
+    - deployment
+    - rolling
+    - loadbalancer
+    - iptables
+
+dependencies: []
