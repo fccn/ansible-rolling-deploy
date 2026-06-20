@@ -28,12 +28,20 @@ Install from Ansible Galaxy:
 ansible-galaxy install fccn.ansible_rolling_deploy
 ```
 
-Or add to `requirements.yml`:
+Or add to `requirements.yml` (pattern used by [fccn/nau_playbooks](https://github.com/fccn/nau_playbooks/blob/master/requirements.yml)):
 
 ```yaml
 roles:
-  - name: fccn.ansible_rolling_deploy
-    version: main
+  # Rolling deploy role that uses iptables to manage load balancer connections
+  # to a cluster of nodes applying a rolling update strategy
+  - src: git+https://github.com/fccn/ansible-rolling-deploy.git
+    version: main  # pin to a commit SHA in production
+```
+
+Then install with:
+
+```bash
+ansible-galaxy install -r requirements.yml -p vendor/roles
 ```
 
 ## Role Variables
@@ -170,6 +178,113 @@ rolling_deploy_parent_servers_ipv6:
       vars:
         rolling_deploy_starting: false
         rolling_deploy_parent_servers_ipv4: ['172.24.1.81']
+```
+
+### Reusable `close_node` / `open_node` Pattern
+
+For repositories that deploy many services, the recommended pattern (as used in [fccn/nau_playbooks](https://github.com/fccn/nau_playbooks/tree/master/tasks)) is to centralise the rolling-deploy + keepalived + health-check logic in two reusable task files and import them from every service playbook.
+
+**`tasks/close_node.yml`** — drain traffic before deploy:
+
+```yaml
+- name: Lower keepalived priority to force VIP swap
+  import_role:
+    name: ansible-keepalived
+  vars:
+    keepalived_priority_override: 1
+  when: keepalived_vrrp_instances is defined and (keepalived_vrrp_instances | length > 0)
+
+- name: Flush handlers so any pending restarts run before we block traffic
+  meta: flush_handlers
+
+- name: Block load balancer connections
+  import_role:
+    name: ansible-rolling-deploy
+  vars:
+    rolling_deploy_starting: true
+  when: rolling_deploy_enabled | default(true) | bool
+```
+
+**`tasks/open_node.yml`** — restore traffic after deploy:
+
+```yaml
+- name: Open load balancer connections
+  import_role:
+    name: ansible-rolling-deploy
+  vars:
+    rolling_deploy_starting: false
+  when: rolling_deploy_enabled | default(true) | bool
+
+- name: Restore keepalived priority
+  import_role:
+    name: ansible-keepalived
+  vars:
+    keepalived_priority_override: ""
+  when: keepalived_vrrp_instances is defined and (keepalived_vrrp_instances | length > 0)
+```
+
+**`group_vars/all/rolling_deploy.yml`** — resolve load balancers once from inventory:
+
+```yaml
+---
+rolling_deploy_parent_servers_ipv4: "{{ groups['balancer_servers'] | map('extract', hostvars, ['ansible_host']) | list }}"
+```
+
+**Service playbook usage** — import the helpers around the deploy task:
+
+```yaml
+- name: Deploy financial manager servers
+  hosts: financial_manager_docker_servers
+  serial: "{{ serial_number | default(1) }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - import_tasks: tasks/close_node.yml
+      when: (groups['financial_manager_docker_servers'] | length) > 1
+
+    - name: Deploy app
+      import_role:
+        name: financial_manager_docker_deploy
+
+    - import_tasks: tasks/healthcheck.yml
+
+    - import_tasks: tasks/open_node.yml
+      when: (groups['financial_manager_docker_servers'] | length) > 1
+```
+
+### Generic Rolling Execute Playbook
+
+A common companion is a `rolling_execute.yml` playbook that runs an arbitrary command against a cluster with the same close/health/open cycle — useful for `docker pull`, rolling restarts, or one-off maintenance:
+
+```yaml
+---
+- hosts: all
+  serial: "{{ serial_number | default(1) }}"
+  become: true
+  gather_facts: true
+  vars:
+    rolling_deploy_enabled: true
+  tasks:
+    - assert:
+        that: command is defined
+        fail_msg: You need to pass -e command='...'
+
+    - import_tasks: tasks/close_node.yml
+
+    - name: Run command
+      shell: "{{ command }}"
+      register: exec_output
+
+    - import_tasks: tasks/healthcheck.yml
+    - import_tasks: tasks/open_node.yml
+```
+
+Invoke as:
+
+```bash
+ansible-playbook -i hosts.ini rolling_execute.yml \
+  --limit mongo_docker_servers \
+  -e "command='docker pull mongo:6.0'"
 ```
 
 ## How It Works
