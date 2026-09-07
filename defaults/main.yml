@@ -35,3 +35,10 @@ rolling_deploy_graceful_reject_seconds: 0
 # Target and reject type used only during the graceful phase above.
 rolling_deploy_graceful_reject_jump: REJECT
 rolling_deploy_graceful_reject_with: tcp-reset
+
+# Comment strings used to fingerprint rules created by this role, so a
+# pre-existing rule blocking the parent servers can be recognized as "ours"
+# (e.g. a leftover from an earlier interrupted run) versus a genuinely
+# foreign rule this role has no knowledge of.
+rolling_deploy_iptables_comment: Block parent servers connections to forward traffic to other server
+rolling_deploy_graceful_reject_comment: Rolling deploy graceful drain - reject only new connections from parent servers, existing connections are left alone

@@ -27,6 +27,37 @@
     - rolling_deploy
     - always
 
+# Runs before anything is inserted below, so a foreign rule is caught (and
+# fails the play) before we touch iptables at all - see check_foreign_rules.yml
+# for the recognized-vs-foreign classification logic.
+- name: Check for pre-existing rules blocking parent servers before starting (IPv4)
+  include_tasks: check_foreign_rules.yml
+  vars:
+    rolling_deploy_check_ip_version: ipv4
+    rolling_deploy_check_iptables_bin: iptables
+    rolling_deploy_check_parent_servers: "{{ rolling_deploy_parent_servers_ipv4 }}"
+    rolling_deploy_check_mode: preflight
+  when:
+    - rolling_deploy_starting | bool
+    - rolling_deploy_parent_servers_ipv4 | length > 0
+  tags:
+    - rolling_deploy
+    - always
+
+- name: Check for pre-existing rules blocking parent servers before starting (IPv6)
+  include_tasks: check_foreign_rules.yml
+  vars:
+    rolling_deploy_check_ip_version: ipv6
+    rolling_deploy_check_iptables_bin: ip6tables
+    rolling_deploy_check_parent_servers: "{{ rolling_deploy_parent_servers_ipv6 }}"
+    rolling_deploy_check_mode: preflight
+  when:
+    - rolling_deploy_starting | bool
+    - rolling_deploy_parent_servers_ipv6 | length > 0
+  tags:
+    - rolling_deploy
+    - always
+
 # Present when starting, absent when stopping - mirrors the DROP rule below.
 # On start this is inserted ahead of the (not yet present) DROP rule; once the
 # grace period elapses and DROP is inserted above it, it becomes shadowed
@@ -47,12 +78,17 @@
       - NEW
     jump: "{{ rolling_deploy_graceful_reject_jump }}"
     reject_with: "{{ rolling_deploy_graceful_reject_with }}"
-    comment: Rolling deploy graceful drain - reject only new connections from parent servers, existing connections are left alone
+    comment: "{{ rolling_deploy_graceful_reject_comment }}"
     state: "{{ rolling_deploy_iptables_state }}" # present or absent
   loop: "{{ rolling_deploy_chains }}"
   when:
     - rolling_deploy_parent_servers_ipv4 | length > 0
-    - rolling_deploy_graceful_reject_seconds | int > 0
+    # Only gate the insert on the grace period; always attempt the removal
+    # on stop even if rolling_deploy_graceful_reject_seconds is 0 or unset
+    # at that point (e.g. it was only passed as a task-level var to the
+    # start call) - a rule left over from a start where it was > 0 must
+    # still get cleaned up.
+    - (rolling_deploy_graceful_reject_seconds | int > 0) or not (rolling_deploy_starting | bool)
   become: yes
   tags:
     - rolling_deploy
@@ -70,12 +106,12 @@
       - NEW
     jump: "{{ rolling_deploy_graceful_reject_jump }}"
     reject_with: "{{ rolling_deploy_graceful_reject_with }}"
-    comment: Rolling deploy graceful drain - reject only new connections from parent servers, existing connections are left alone
+    comment: "{{ rolling_deploy_graceful_reject_comment }}"
     state: "{{ rolling_deploy_iptables_state }}" # present or absent
   loop: "{{ rolling_deploy_chains }}"
   when:
     - rolling_deploy_parent_servers_ipv6 | length > 0
-    - rolling_deploy_graceful_reject_seconds | int > 0
+    - (rolling_deploy_graceful_reject_seconds | int > 0) or not (rolling_deploy_starting | bool)
   become: yes
   tags:
     - rolling_deploy
@@ -99,7 +135,7 @@
     chain: "{{ item }}"
     source: "{{ rolling_deploy_parent_servers_ipv4 | join(',') }}"
     jump: "{{ rolling_deploy_iptables_jump }}"
-    comment: Block parent servers connections to forward traffic to other server
+    comment: "{{ rolling_deploy_iptables_comment }}"
     state: "{{ rolling_deploy_iptables_state }}" # present or absent
   loop: "{{ rolling_deploy_chains }}"
   when: rolling_deploy_parent_servers_ipv4 | length > 0
@@ -126,11 +162,42 @@
     chain: "{{ item }}"
     source: "{{ rolling_deploy_parent_servers_ipv6 | join(',') }}"
     jump: "{{ rolling_deploy_iptables_jump }}"
-    comment: Block parent servers connections to forward traffic to other server
+    comment: "{{ rolling_deploy_iptables_comment }}"
     state: "{{ rolling_deploy_iptables_state }}" # present or absent
   loop: "{{ rolling_deploy_chains }}"
   when: rolling_deploy_parent_servers_ipv6 | length > 0
   become: yes
+  tags:
+    - rolling_deploy
+    - always
+
+# Runs as the safety net after everything above has been removed: nothing
+# should still be blocking the parent servers at this point, so any match
+# here (recognized or foreign) fails - see check_foreign_rules.yml.
+- name: Check for leftover rules blocking parent servers after stopping (IPv4)
+  include_tasks: check_foreign_rules.yml
+  vars:
+    rolling_deploy_check_ip_version: ipv4
+    rolling_deploy_check_iptables_bin: iptables
+    rolling_deploy_check_parent_servers: "{{ rolling_deploy_parent_servers_ipv4 }}"
+    rolling_deploy_check_mode: postflight
+  when:
+    - not (rolling_deploy_starting | bool)
+    - rolling_deploy_parent_servers_ipv4 | length > 0
+  tags:
+    - rolling_deploy
+    - always
+
+- name: Check for leftover rules blocking parent servers after stopping (IPv6)
+  include_tasks: check_foreign_rules.yml
+  vars:
+    rolling_deploy_check_ip_version: ipv6
+    rolling_deploy_check_iptables_bin: ip6tables
+    rolling_deploy_check_parent_servers: "{{ rolling_deploy_parent_servers_ipv6 }}"
+    rolling_deploy_check_mode: postflight
+  when:
+    - not (rolling_deploy_starting | bool)
+    - rolling_deploy_parent_servers_ipv6 | length > 0
   tags:
     - rolling_deploy
     - always
