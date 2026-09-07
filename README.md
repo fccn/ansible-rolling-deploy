@@ -60,6 +60,10 @@ ansible-galaxy install -r requirements.yml -p vendor/roles
 | `rolling_deploy_parent_servers_ipv6` | `[]` | List of IPv6 addresses of load balancers |
 | `rolling_deploy_iptables_state` | Auto-calculated | Iptables rule state (`present` or `absent`) |
 | `rolling_deploy_chains` | `[FORWARD, INPUT]` | Iptables chains to modify |
+| `rolling_deploy_iptables_jump` | `DROP` | Iptables target used to block parent servers. `DROP` silently discards every packet, new and already-established alike |
+| `rolling_deploy_graceful_reject_seconds` | `0` | Optional grace period, in seconds. When `> 0`, blocks only *new* connections with REJECT first, waits this long, then falls back to `rolling_deploy_iptables_jump` for everything. `0` (default) disables this and preserves the original immediate-block behavior |
+| `rolling_deploy_graceful_reject_jump` | `REJECT` | Target used only during the graceful phase above |
+| `rolling_deploy_graceful_reject_with` | `tcp-reset` | Reject type used only during the graceful phase above. If set to `tcp-reset`, the role automatically restricts that rule to `-p tcp` since the kernel rejects `tcp-reset` on a rule that doesn't match TCP; other reject types (e.g. `icmp-port-unreachable`) apply to all protocols as usual |
 
 See [defaults/main.yml](defaults/main.yml) for complete variable definitions.
 
@@ -291,8 +295,8 @@ ansible-playbook -i hosts.ini rolling_execute.yml \
 
 1. **Traffic Blocking Phase** (`rolling_deploy_starting: true`)
    - Inserts iptables rules at the top of FORWARD and INPUT chains
-   - Blocks incoming connections from specified load balancers
-   - Existing connections remain active
+   - Blocks incoming connections from specified load balancers using `rolling_deploy_iptables_jump` (`DROP` by default) — this matches every packet from the load balancer, including ones belonging to already-established connections, so in-flight requests are cut immediately
+   - If `rolling_deploy_graceful_reject_seconds` is set, the block is graceful instead: only *new* connection attempts are rejected (fast `tcp-reset`, so the load balancer notices and stops routing new traffic quickly) while already-established connections are left alone to finish naturally; after the configured number of seconds the role falls back to the standard `rolling_deploy_iptables_jump` rule covering all connection states, and only then returns control to the calling playbook
 
 2. **Deployment Phase**
    - Node is isolated from new traffic
@@ -326,7 +330,17 @@ This ensures at least some nodes remain available during the deployment.
 
 ### Connection Draining
 
-Add a delay after blocking traffic to allow existing connections to complete:
+By default, blocking is immediate and unconditional — `DROP` discards packets for already-established connections too, so any in-flight request is cut the instant the block is applied.
+
+If that's a problem (e.g. long-running requests, monitors alerting on the cutover), set `rolling_deploy_graceful_reject_seconds` to give existing connections a chance to finish before the hard block takes effect:
+
+```yaml
+rolling_deploy_graceful_reject_seconds: 30
+```
+
+This adds up to 30 seconds to the blocking phase itself (it runs before control returns to your playbook), but only new connection attempts are affected during that window — nothing already open gets cut early. After the grace period, the role falls back to `rolling_deploy_iptables_jump` (`DROP` by default) as before.
+
+Note this is different from the external delay pattern below, which pauses *after* the node is already fully blocked (of limited use with the default `DROP` behavior, since anything in-flight has already been terminated by the time this task runs):
 
 ```yaml
 - name: Wait for connections to drain
