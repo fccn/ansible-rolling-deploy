@@ -6,31 +6,141 @@
       - rolling_deploy_parent_servers_ipv4 is defined
       - rolling_deploy_parent_servers_ipv4 | length > 0
     fail_msg: "rolling_deploy_parent_servers_ipv4 is not defined or empty. Please define it in your playbook or inventory."
-  tags: 
+  tags:
     - rolling_deploy
     - always
 
 - name: Debug rolling deploy action IPv4
   debug:
     msg: "{{ 'Block' if ( rolling_deploy_starting | default('false') ) else 'Open' }} parent servers {{ rolling_deploy_parent_servers_ipv4 | join(',') }} on iptables"
-  tags: 
+  tags:
     - rolling_deploy
     - always
 
-- name: Change parent servers IPv4 using iptables
-  iptables: 
+- name: Debug graceful drain phase
+  debug:
+    msg: "Graceful drain enabled: reject NEW connections from parent servers for {{ rolling_deploy_graceful_reject_seconds }}s before falling back to {{ rolling_deploy_iptables_jump }}"
+  when:
+    - rolling_deploy_starting | bool
+    - rolling_deploy_graceful_reject_seconds | int > 0
+  tags:
+    - rolling_deploy
+    - always
+
+# Runs before anything is inserted below, so a foreign rule is caught (and
+# fails the play) before we touch iptables at all - see check_foreign_rules.yml
+# for the recognized-vs-foreign classification logic.
+- name: Check for pre-existing rules blocking parent servers before starting (IPv4)
+  include_tasks: check_foreign_rules.yml
+  vars:
+    rolling_deploy_check_ip_version: ipv4
+    rolling_deploy_check_iptables_bin: iptables
+    rolling_deploy_check_parent_servers: "{{ rolling_deploy_parent_servers_ipv4 }}"
+    rolling_deploy_check_mode: preflight
+  when:
+    - rolling_deploy_starting | bool
+    - rolling_deploy_parent_servers_ipv4 | length > 0
+  tags:
+    - rolling_deploy
+    - always
+
+- name: Check for pre-existing rules blocking parent servers before starting (IPv6)
+  include_tasks: check_foreign_rules.yml
+  vars:
+    rolling_deploy_check_ip_version: ipv6
+    rolling_deploy_check_iptables_bin: ip6tables
+    rolling_deploy_check_parent_servers: "{{ rolling_deploy_parent_servers_ipv6 }}"
+    rolling_deploy_check_mode: preflight
+  when:
+    - rolling_deploy_starting | bool
+    - rolling_deploy_parent_servers_ipv6 | length > 0
+  tags:
+    - rolling_deploy
+    - always
+
+# Present when starting, absent when stopping - mirrors the DROP rule below.
+# On start this is inserted ahead of the (not yet present) DROP rule; once the
+# grace period elapses and DROP is inserted above it, it becomes shadowed
+# (DROP matches every ctstate, so nothing reaches this rule anymore) and is
+# only actually removed on the following stop call, alongside DROP.
+- name: Change graceful reject-new-only rule IPv4 (parent servers)
+  iptables:
     ip_version: ipv4
     action: insert # rule should be inserted at the top
     rule_num: "1"
     chain: "{{ item }}"
     source: "{{ rolling_deploy_parent_servers_ipv4 | join(',') }}"
-    jump: DROP
-    comment: Block parent servers connections to forward traffic to other server
+    # The tcp-reset reject type is only accepted by the kernel (xt_REJECT) on
+    # a rule that also matches -p tcp - otherwise the insert itself fails with
+    # "iptables: Invalid argument", not a validation error at parse time.
+    protocol: "{{ 'tcp' if rolling_deploy_graceful_reject_with == 'tcp-reset' else omit }}"
+    ctstate:
+      - NEW
+    jump: "{{ rolling_deploy_graceful_reject_jump }}"
+    reject_with: "{{ rolling_deploy_graceful_reject_with }}"
+    comment: "{{ rolling_deploy_graceful_reject_comment }}"
+    state: "{{ rolling_deploy_iptables_state }}" # present or absent
+  loop: "{{ rolling_deploy_chains }}"
+  when:
+    - rolling_deploy_parent_servers_ipv4 | length > 0
+    # Only gate the insert on the grace period; always attempt the removal
+    # on stop even if rolling_deploy_graceful_reject_seconds is 0 or unset
+    # at that point (e.g. it was only passed as a task-level var to the
+    # start call) - a rule left over from a start where it was > 0 must
+    # still get cleaned up.
+    - (rolling_deploy_graceful_reject_seconds | int > 0) or not (rolling_deploy_starting | bool)
+  become: yes
+  tags:
+    - rolling_deploy
+    - always
+
+- name: Change graceful reject-new-only rule IPv6 (parent servers)
+  iptables:
+    ip_version: ipv6
+    action: insert
+    rule_num: "1"
+    chain: "{{ item }}"
+    source: "{{ rolling_deploy_parent_servers_ipv6 | join(',') }}"
+    protocol: "{{ 'tcp' if rolling_deploy_graceful_reject_with == 'tcp-reset' else omit }}"
+    ctstate:
+      - NEW
+    jump: "{{ rolling_deploy_graceful_reject_jump }}"
+    reject_with: "{{ rolling_deploy_graceful_reject_with }}"
+    comment: "{{ rolling_deploy_graceful_reject_comment }}"
+    state: "{{ rolling_deploy_iptables_state }}" # present or absent
+  loop: "{{ rolling_deploy_chains }}"
+  when:
+    - rolling_deploy_parent_servers_ipv6 | length > 0
+    - (rolling_deploy_graceful_reject_seconds | int > 0) or not (rolling_deploy_starting | bool)
+  become: yes
+  tags:
+    - rolling_deploy
+    - always
+
+- name: Wait for the graceful drain period to elapse
+  wait_for:
+    timeout: "{{ rolling_deploy_graceful_reject_seconds }}"
+  when:
+    - rolling_deploy_starting | bool
+    - rolling_deploy_graceful_reject_seconds | int > 0
+  tags:
+    - rolling_deploy
+    - always
+
+- name: Change parent servers IPv4 using iptables
+  iptables:
+    ip_version: ipv4
+    action: insert # rule should be inserted at the top
+    rule_num: "1"
+    chain: "{{ item }}"
+    source: "{{ rolling_deploy_parent_servers_ipv4 | join(',') }}"
+    jump: "{{ rolling_deploy_iptables_jump }}"
+    comment: "{{ rolling_deploy_iptables_comment }}"
     state: "{{ rolling_deploy_iptables_state }}" # present or absent
   loop: "{{ rolling_deploy_chains }}"
   when: rolling_deploy_parent_servers_ipv4 | length > 0
   become: yes
-  tags: 
+  tags:
     - rolling_deploy
     - always
 
@@ -38,12 +148,12 @@
   debug:
     msg: "{{ 'Block' if ( rolling_deploy_starting | default('false') ) else 'Open' }} parent servers {{ rolling_deploy_parent_servers_ipv6 | join(',') }} on iptables"
   when: rolling_deploy_parent_servers_ipv6 | length > 0
-  tags: 
+  tags:
     - rolling_deploy
     - always
 
 - name: Change parent servers IPv6 using iptables
-  iptables: 
+  iptables:
     ip_version: ipv6
     # Rule should be inserted at the top
     action: insert
@@ -51,12 +161,43 @@
     rule_num: "1"
     chain: "{{ item }}"
     source: "{{ rolling_deploy_parent_servers_ipv6 | join(',') }}"
-    jump: DROP
-    comment: Block parent servers connections to forward traffic to other server
+    jump: "{{ rolling_deploy_iptables_jump }}"
+    comment: "{{ rolling_deploy_iptables_comment }}"
     state: "{{ rolling_deploy_iptables_state }}" # present or absent
   loop: "{{ rolling_deploy_chains }}"
   when: rolling_deploy_parent_servers_ipv6 | length > 0
   become: yes
-  tags: 
+  tags:
+    - rolling_deploy
+    - always
+
+# Runs as the safety net after everything above has been removed: nothing
+# should still be blocking the parent servers at this point, so any match
+# here (recognized or foreign) fails - see check_foreign_rules.yml.
+- name: Check for leftover rules blocking parent servers after stopping (IPv4)
+  include_tasks: check_foreign_rules.yml
+  vars:
+    rolling_deploy_check_ip_version: ipv4
+    rolling_deploy_check_iptables_bin: iptables
+    rolling_deploy_check_parent_servers: "{{ rolling_deploy_parent_servers_ipv4 }}"
+    rolling_deploy_check_mode: postflight
+  when:
+    - not (rolling_deploy_starting | bool)
+    - rolling_deploy_parent_servers_ipv4 | length > 0
+  tags:
+    - rolling_deploy
+    - always
+
+- name: Check for leftover rules blocking parent servers after stopping (IPv6)
+  include_tasks: check_foreign_rules.yml
+  vars:
+    rolling_deploy_check_ip_version: ipv6
+    rolling_deploy_check_iptables_bin: ip6tables
+    rolling_deploy_check_parent_servers: "{{ rolling_deploy_parent_servers_ipv6 }}"
+    rolling_deploy_check_mode: postflight
+  when:
+    - not (rolling_deploy_starting | bool)
+    - rolling_deploy_parent_servers_ipv6 | length > 0
+  tags:
     - rolling_deploy
     - always

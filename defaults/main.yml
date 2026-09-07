@@ -14,3 +14,31 @@ rolling_deploy_iptables_state: "{{ 'present' if ( rolling_deploy_starting | defa
 rolling_deploy_chains:
   - FORWARD # if docker based deployment
   - INPUT   # if non-docker based deployment or docker using host network mode
+
+# Iptables target used to block parent servers. DROP silently discards every
+# packet (new connection attempts and already-established ones alike). This
+# is the default, unchanged behavior.
+rolling_deploy_iptables_jump: DROP
+
+# Optional graceful-drain grace period, in seconds. When set to a value > 0
+# and rolling_deploy_starting is true, the role first blocks only NEW
+# connections from the parent servers with REJECT (so already-established/
+# in-flight connections are left alone and can finish naturally), waits this
+# many seconds, then replaces that rule with the standard
+# rolling_deploy_iptables_jump rule (DROP by default) covering all connection
+# states, before returning control to the calling playbook.
+#
+# Default is 0 (disabled): the role behaves exactly as before, immediately
+# applying rolling_deploy_iptables_jump to everything, with no graceful phase.
+rolling_deploy_graceful_reject_seconds: 0
+
+# Target and reject type used only during the graceful phase above.
+rolling_deploy_graceful_reject_jump: REJECT
+rolling_deploy_graceful_reject_with: tcp-reset
+
+# Comment strings used to fingerprint rules created by this role, so a
+# pre-existing rule blocking the parent servers can be recognized as "ours"
+# (e.g. a leftover from an earlier interrupted run) versus a genuinely
+# foreign rule this role has no knowledge of.
+rolling_deploy_iptables_comment: Block parent servers connections to forward traffic to other server
+rolling_deploy_graceful_reject_comment: Rolling deploy graceful drain - reject only new connections from parent servers, existing connections are left alone

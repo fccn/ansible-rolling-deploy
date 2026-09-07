@@ -1,0 +1,66 @@
+---
+# Included per IP version with vars: rolling_deploy_check_ip_version (ipv4/ipv6),
+# rolling_deploy_check_iptables_bin, rolling_deploy_check_parent_servers,
+# rolling_deploy_check_mode (preflight or postflight).
+#
+# preflight (before start): a pre-existing rule carrying this role's own
+# comment is a harmless leftover from an earlier interrupted run - logged,
+# execution continues normally. Anything else blocking the same servers is
+# a foreign rule this role won't clean up automatically, so fail loudly.
+#
+# postflight (after stop): nothing should still be blocking the parent
+# servers at this point, recognized or not - if something is, either a
+# foreign rule was there all along, or this role's own removal didn't fully
+# clean up (e.g. a duplicate rule) - fail loudly either way.
+
+- name: Dump current {{ rolling_deploy_check_ip_version }} rules for chain
+  ansible.builtin.command:
+    cmd: "{{ rolling_deploy_check_iptables_bin }} -S {{ item }}"
+  register: rolling_deploy_existing_rules
+  changed_when: false
+  check_mode: no # read-only dump - must still run under --check, or the assert below has nothing to check
+  loop: "{{ rolling_deploy_chains }}"
+  become: yes
+  tags:
+    - rolling_deploy
+    - always
+
+- name: Check for rules blocking parent servers ({{ rolling_deploy_check_ip_version }}, {{ rolling_deploy_check_mode }})
+  vars:
+    # Delimited by "start-of-line or a space/comma" and "a space/comma or
+    # end-of-line" instead of regex \b, so an IP that's a prefix of another
+    # (e.g. 172.24.1.8 vs 172.24.1.81) can't cause a false match - iptables
+    # -S always renders -s as "-s IP1,IP2 " with those exact separators.
+    # \b doesn't help here anyway: it treats "." as already a boundary, so
+    # it can't tell a full octet apart from a truncated one.
+    rolling_deploy_source_ip_pattern: "{{ '(^|[ ,])(' ~ (rolling_deploy_check_parent_servers | map('regex_escape') | join('|')) ~ ')([ ,]|$)' }}"
+    rolling_deploy_jump_pattern: "{{ '-j (' ~ ([rolling_deploy_iptables_jump, rolling_deploy_graceful_reject_jump] | map('regex_escape') | join('|')) ~ ')([ ]|$)' }}"
+    rolling_deploy_matching_lines: "{{ rolling_deploy_existing_rules.results | map(attribute='stdout_lines') | flatten
+      | select('search', rolling_deploy_source_ip_pattern)
+      | select('search', rolling_deploy_jump_pattern)
+      | list }}"
+    rolling_deploy_recognized_lines: "{{ rolling_deploy_matching_lines
+      | select('search', ([rolling_deploy_iptables_comment, rolling_deploy_graceful_reject_comment] | map('regex_escape') | join('|')))
+      | list }}"
+    rolling_deploy_foreign_lines: "{{ rolling_deploy_matching_lines | difference(rolling_deploy_recognized_lines) }}"
+    rolling_deploy_lines_to_fail_on: "{{ rolling_deploy_foreign_lines if rolling_deploy_check_mode == 'preflight' else rolling_deploy_matching_lines }}"
+  block:
+    - name: Print pre-existing rule(s) recognized as this role's own ({{ rolling_deploy_check_ip_version }})
+      debug:
+        msg: "Found {{ rolling_deploy_recognized_lines | length }} pre-existing rule(s) already matching this role's own rules (likely a leftover from an earlier interrupted run) - continuing normally: {{ rolling_deploy_recognized_lines }}"
+      when:
+        - rolling_deploy_check_mode == 'preflight'
+        - rolling_deploy_recognized_lines | length > 0
+
+    - name: Fail if a rule still blocks the parent servers ({{ rolling_deploy_check_ip_version }})
+      assert:
+        that:
+          - rolling_deploy_lines_to_fail_on | length == 0
+        fail_msg: >-
+          Found rule(s) on {{ inventory_hostname }} blocking the parent servers{{ '' if rolling_deploy_check_mode == 'preflight' else ' after stop' }}:
+          {{ rolling_deploy_foreign_lines | length }} foreign (not created by this role): {{ rolling_deploy_foreign_lines }}.
+          {{ (rolling_deploy_recognized_lines | length ~ ' created by this role but not fully removed: ' ~ rolling_deploy_recognized_lines ~ '.') if rolling_deploy_check_mode == 'postflight' else '' }}
+          Refusing to continue since these will not be cleaned up automatically - investigate and remove manually.
+  tags:
+    - rolling_deploy
+    - always

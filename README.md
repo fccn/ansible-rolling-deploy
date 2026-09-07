@@ -12,6 +12,7 @@ An Ansible role for implementing zero-downtime rolling deployments across a clus
 - 🐳 **Docker and non-Docker compatible** - Works with both deployment types
 - 🌐 **IPv4 and IPv6 support** - Dual-stack network compatibility
 - ⚡ **Sequential deployment control** - Configurable serial execution
+- 🛡️ **Foreign-rule guard** - Fails loudly instead of silently leaving a node blocked if a rule it doesn't recognize is already in the way
 
 ## Requirements
 
@@ -60,6 +61,12 @@ ansible-galaxy install -r requirements.yml -p vendor/roles
 | `rolling_deploy_parent_servers_ipv6` | `[]` | List of IPv6 addresses of load balancers |
 | `rolling_deploy_iptables_state` | Auto-calculated | Iptables rule state (`present` or `absent`) |
 | `rolling_deploy_chains` | `[FORWARD, INPUT]` | Iptables chains to modify |
+| `rolling_deploy_iptables_jump` | `DROP` | Iptables target used to block parent servers. `DROP` silently discards every packet, new and already-established alike |
+| `rolling_deploy_graceful_reject_seconds` | `0` | Optional grace period, in seconds. When `> 0`, blocks only *new* connections with REJECT first, waits this long, then falls back to `rolling_deploy_iptables_jump` for everything. `0` (default) disables this and preserves the original immediate-block behavior |
+| `rolling_deploy_graceful_reject_jump` | `REJECT` | Target used only during the graceful phase above |
+| `rolling_deploy_graceful_reject_with` | `tcp-reset` | Reject type used only during the graceful phase above. If set to `tcp-reset`, the role automatically restricts that rule to `-p tcp` since the kernel rejects `tcp-reset` on a rule that doesn't match TCP; other reject types (e.g. `icmp-port-unreachable`) apply to all protocols as usual |
+| `rolling_deploy_iptables_comment` | `Block parent servers...` | Comment attached to the `rolling_deploy_iptables_jump` rule. Used to fingerprint the role's own rules for the foreign-rule guard below - only change this if you also need to change what the guard recognizes as "ours" |
+| `rolling_deploy_graceful_reject_comment` | `Rolling deploy graceful drain...` | Same as above, for the graceful-phase rule |
 
 See [defaults/main.yml](defaults/main.yml) for complete variable definitions.
 
@@ -290,9 +297,10 @@ ansible-playbook -i hosts.ini rolling_execute.yml \
 ## How It Works
 
 1. **Traffic Blocking Phase** (`rolling_deploy_starting: true`)
+   - Before touching iptables, checks whether a rule already blocks the parent servers on the FORWARD/INPUT chains (see [Foreign-Rule Guard](#foreign-rule-guard) below) - fails immediately if it finds one this role didn't create
    - Inserts iptables rules at the top of FORWARD and INPUT chains
-   - Blocks incoming connections from specified load balancers
-   - Existing connections remain active
+   - Blocks incoming connections from specified load balancers using `rolling_deploy_iptables_jump` (`DROP` by default) — this matches every packet from the load balancer, including ones belonging to already-established connections, so in-flight requests are cut immediately
+   - If `rolling_deploy_graceful_reject_seconds` is set, the block is graceful instead: only *new* connection attempts are rejected (fast `tcp-reset`, so the load balancer notices and stops routing new traffic quickly) while already-established connections are left alone to finish naturally; after the configured number of seconds the role falls back to the standard `rolling_deploy_iptables_jump` rule covering all connection states, and only then returns control to the calling playbook
 
 2. **Deployment Phase**
    - Node is isolated from new traffic
@@ -300,9 +308,10 @@ ansible-playbook -i hosts.ini rolling_execute.yml \
    - Health checks can be performed in isolation
 
 3. **Traffic Restoration Phase** (`rolling_deploy_starting: false`)
-   - Removes iptables blocking rules
+   - Removes iptables blocking rules (including the graceful-phase rule above, if it's still around - see [Important Considerations](#important-considerations))
    - Node begins accepting new connections
    - Load balancer resumes forwarding traffic
+   - Checks again that nothing is still blocking the parent servers - fails if either a foreign rule or one of this role's own rules is still present
 
 ### Iptables Chains Explained
 
@@ -324,15 +333,44 @@ ansible-playbook -i hosts.ini rolling_execute.yml \
 
 This ensures at least some nodes remain available during the deployment.
 
+### Foreign-Rule Guard
+
+Before blocking (on `start`) and after unblocking (on `stop`), the role dumps the current FORWARD/INPUT rules and checks whether anything is already blocking (`DROP`/`REJECT`) the parent servers:
+
+- **Before start**: a match carrying this role's own `--comment` (see `rolling_deploy_iptables_comment` / `rolling_deploy_graceful_reject_comment`) is treated as a harmless leftover from an earlier interrupted run - it's logged and the play continues normally, so retrying a failed deploy doesn't trip the guard. A match that *doesn't* carry the role's comment is a rule this role has no knowledge of and won't clean up automatically, so the play fails immediately, before any new rule is inserted.
+- **After stop**: nothing should be blocking the parent servers at this point, recognized or not, so any remaining match fails the play - whether it's a foreign rule that was there all along, or one of this role's own rules that somehow survived removal (e.g. a duplicate - see below).
+
+This check is unconditional (not gated by `rolling_deploy_graceful_reject_seconds`) and always runs, including under `--check` mode.
+
+If the guard fails, the failure message lists the exact `iptables -S` line(s) it found - use that to decide whether to remove the rule manually (see [Manual Rule Cleanup](#manual-rule-cleanup)) or investigate why it's there before re-running.
+
+### Duplicate Rules
+
+The `iptables` module treats a rule as present if one with the exact same specification already exists anywhere in the chain, regardless of position - so re-running `start` never inserts a duplicate. However, removal (`iptables -D <chain> <rulespec>`) only removes the *first* matching instance per invocation: if the exact same rule somehow ends up duplicated (e.g. two independent `start` runs raced, or the role's own removal logic changed while a rule from an old version was still in place), a single `stop` clears only one copy, and the foreign-rule guard above will (correctly) fail after that `stop` because a recognized rule is still present. Running `stop` again clears the next copy.
+
 ### Connection Draining
 
-Add a delay after blocking traffic to allow existing connections to complete:
+By default, blocking is immediate and unconditional — `DROP` discards packets for already-established connections too, so any in-flight request is cut the instant the block is applied.
+
+If that's a problem (e.g. long-running requests, monitors alerting on the cutover), set `rolling_deploy_graceful_reject_seconds` to give existing connections a chance to finish before the hard block takes effect:
+
+```yaml
+rolling_deploy_graceful_reject_seconds: 30
+```
+
+This adds up to 30 seconds to the blocking phase itself (it runs before control returns to your playbook), but only new connection attempts are affected during that window — nothing already open gets cut early. After the grace period, the role falls back to `rolling_deploy_iptables_jump` (`DROP` by default) as before.
+
+Note this is different from the external delay pattern below, which pauses *after* the node is already fully blocked (of limited use with the default `DROP` behavior, since anything in-flight has already been terminated by the time this task runs):
 
 ```yaml
 - name: Wait for connections to drain
   wait_for:
     timeout: 30
 ```
+
+### Known Limitation: Repeated `start` Without a `stop`
+
+If `rolling_deploy_starting: true` runs again before a matching `stop` (e.g. a retried playbook run, or a bug in the calling play), the graceful-drain phase re-runs its full `wait_for` even though the standard `rolling_deploy_iptables_jump` rule (`DROP` by default) from the previous `start` is already active and blocking everything, established connections included. The wait isn't harmful by itself - it just delays returning control - but it no longer protects in-flight connections during that second wait, since they're already being dropped. The [foreign-rule guard](#foreign-rule-guard) doesn't treat this as an error, since it can't tell a legitimate retry-after-failure from this case: both leave the role's own, recognized rule in place. Avoid triggering a second `start` without an intervening `stop` if the graceful drain matters for your use case.
 
 ### Health Checks
 
@@ -372,6 +410,12 @@ If deployment fails and rules aren't cleaned up:
 sudo iptables -D INPUT -s <load_balancer_ip> -j DROP
 sudo iptables -D FORWARD -s <load_balancer_ip> -j DROP
 ```
+
+### Foreign-Rule Guard Failure
+
+If the role fails with a message like `Found rule(s) on <host> blocking the parent servers... foreign (not created by this role): [...]`, it found a `DROP`/`REJECT` rule for the parent servers that doesn't carry this role's `--comment`. The message includes the exact `iptables -S` line(s) - inspect them (`sudo iptables -S <chain>` / `sudo ip6tables -S <chain>`) and either remove the rule manually if it's stale, or investigate what's creating it if it's not.
+
+If the failure instead says a rule was "created by this role but not fully removed" (only possible after `stop`), this role's own removal didn't clear everything - most likely a [duplicate rule](#duplicate-rules); re-running `stop` should clear the next copy.
 
 ### Verify Role Execution
 
